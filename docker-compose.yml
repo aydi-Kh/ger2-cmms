@@ -1,0 +1,136 @@
+version: "3.9"
+
+networks:
+  ger2-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  mlflow_data:
+
+services:
+  # ── PostgreSQL 16 + TimescaleDB ──────────────────────────────
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: ger2
+      POSTGRES_PASSWORD: ger2pass
+      POSTGRES_DB: ger2_cmms
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ger2"]
+      interval: 10s; timeout: 5s; retries: 5
+    networks: [ger2-net]
+
+  # ── Redis 7 ──────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes: [redis_data:/data]
+    ports: ["6379:6379"]
+    networks: [ger2-net]
+
+  # ── Zookeeper + Kafka 3.7 ────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment: { ZOOKEEPER_CLIENT_PORT: 2181 }
+    networks: [ger2-net]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes: [kafka_data:/var/lib/kafka/data]
+    networks: [ger2-net]
+
+  # ── Backend API ──────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file: ./backend/.env
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_started }
+      kafka:    { condition: service_started }
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
+    networks: [ger2-net]
+
+  # ── Frontend ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports: ["3000:80"]
+    depends_on: [backend]
+    networks: [ger2-net]
+
+  # ── AI Agents ────────────────────────────────────────────────
+  agent-predictor:
+    build:
+      context: ./agents/predictor
+      dockerfile: Dockerfile
+    depends_on: [kafka, postgres]
+    networks: [ger2-net]
+    restart: unless-stopped
+
+  agent-scheduler:
+    build:
+      context: ./agents/scheduler
+      dockerfile: Dockerfile
+    depends_on: [kafka]
+    networks: [ger2-net]
+    restart: unless-stopped
+
+  agent-compliance:
+    build:
+      context: ./agents/compliance
+      dockerfile: Dockerfile
+    depends_on: [kafka, postgres]
+    networks: [ger2-net]
+    restart: unless-stopped
+
+  agent-cost:
+    build:
+      context: ./agents/cost
+      dockerfile: Dockerfile
+    depends_on: [kafka, postgres]
+    networks: [ger2-net]
+    restart: unless-stopped
+
+  # ── MLflow ───────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri /mlflow
+    volumes: [mlflow_data:/mlflow]
+    ports: ["5000:5000"]
+    networks: [ger2-net]
+
+  # ── Monitoring ───────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes: [./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml]
+    ports: ["9090:9090"]
+    networks: [ger2-net]
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ger2admin
+    ports: ["3001:3000"]
+    networks: [ger2-net]

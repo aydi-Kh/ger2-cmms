@@ -1,0 +1,106 @@
+name: GER2 CMMS CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_BACKEND:  ghcr.io/${{ github.repository }}/ger2-backend
+  IMAGE_FRONTEND: ghcr.io/${{ github.repository }}/ger2-frontend
+  IMAGE_PREDICTOR: ghcr.io/${{ github.repository }}/ger2-agent-predictor
+
+jobs:
+  # ── 1. Unit Tests ─────────────────────────────────────────────
+  unit-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env: { POSTGRES_USER: ger2, POSTGRES_PASSWORD: ger2pass, POSTGRES_DB: ger2_cmms_test }
+        options: --health-cmd pg_isready --health-interval 10s
+      redis:
+        image: redis:7-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r backend/requirements.txt
+      - run: pytest tests/unit --cov=backend/app --cov-report=xml -q
+        env:
+          DATABASE_URL: postgresql+asyncpg://ger2:ger2pass@localhost:5432/ger2_cmms_test
+          REDIS_URL: redis://localhost:6379/0
+          SECRET_KEY: ci-test-secret-key-32-bytes-long!
+      - uses: codecov/codecov-action@v4
+
+  # ── 2. Security Scan ───────────────────────────────────────────
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: "."
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+  # ── 3. Build & Push Images ─────────────────────────────────────
+  build-push:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with: { registry: ${{ env.REGISTRY }}, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ env.IMAGE_BACKEND }}:${{ github.sha }},${{ env.IMAGE_BACKEND }}:latest
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ env.IMAGE_FRONTEND }}:${{ github.sha }},${{ env.IMAGE_FRONTEND }}:latest
+
+  # ── 4. Deploy to Staging ───────────────────────────────────────
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build-push
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Staging K8s manifests
+        run: |
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g" infra/k8s/overlays/staging/kustomization.yaml
+          kubectl apply -k infra/k8s/overlays/staging --kubeconfig=${{ secrets.STAGING_KUBECONFIG }}
+
+  # ── 5. Integration Tests ───────────────────────────────────────
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pytest httpx
+      - run: pytest tests/integration -q
+        env: { API_BASE_URL: ${{ secrets.STAGING_API_URL }} }
+
+  # ── 6. Deploy to Production (main only) ───────────────────────
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Production K8s
+        run: |
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g" infra/k8s/overlays/production/kustomization.yaml
+          kubectl apply -k infra/k8s/overlays/production --kubeconfig=${{ secrets.PROD_KUBECONFIG }}
+          kubectl rollout status deployment/ger2-backend -n ger2-prod --timeout=300s
